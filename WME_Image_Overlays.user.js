@@ -984,7 +984,7 @@ function buildOverlayFromPgw(pgw, blob, imgWidth, imgHeight) {
   // Affine transform: x = A*col + B*row + C,  y = D*col + E*row + F
   var A = pgw.scaleX, B = pgw.rotationX, C = pgw.originX;
   var D = pgw.rotationY, E = pgw.scaleY, F = pgw.originY;
-  // Compute the 4 outer-boundary corners of the image in geographic coordinates (EPSG:4326)
+  // Compute the 4 outer-boundary corners of the image using the affine transform
   var corners = [
     { col: -0.5, row: -0.5 },
     { col: imgWidth - 0.5, row: -0.5 },
@@ -995,12 +995,18 @@ function buildOverlayFromPgw(pgw, blob, imgWidth, imgHeight) {
   });
   var xs = corners.map(function(c) { return c.x; });
   var ys = corners.map(function(c) { return c.y; });
-  var dataProjection = new OpenLayers.Projection('EPSG:4326');
-  var mapProjection = W.map.getProjectionObject();
-  var bounds = new OpenLayers.Bounds(
+  var rawBounds = new OpenLayers.Bounds(
     Math.min.apply(null, xs), Math.min.apply(null, ys),
     Math.max.apply(null, xs), Math.max.apply(null, ys)
-  ).transform(dataProjection, mapProjection);
+  );
+  // If origin coords fit within geographic degree ranges AND the scale is sub-degree
+  // then the coordinates are in EPSG:4326 and must be projected to the map's native CRS.
+  // Otherwise (large origin values in meters, or scale ≥ 1 indicating meters/pixel)
+  // the coordinates are already in the map projection and must be used as-is.
+  var isGeographicDegrees = Math.abs(pgw.originX) <= 180 && Math.abs(pgw.originY) <= 90 && Math.abs(pgw.scaleX) < 1;
+  var bounds = isGeographicDegrees
+    ? rawBounds.transform(new OpenLayers.Projection('EPSG:4326'), W.map.getProjectionObject())
+    : rawBounds;
   // Rotation: atan2(D, A) gives the angle of the image x-axis in geographic space (y-up).
   // Negated to convert from geographic (y-up, CCW-positive) to screen (y-down, CW-positive).
   var rotation = -Math.atan2(D, A) * 180 / Math.PI;
