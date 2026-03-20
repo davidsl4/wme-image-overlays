@@ -44,6 +44,8 @@ async function onWmeReady() {
       import_image: 'Import image',
       import_image_description: 'You can now paste an image from your clipboard in the WME with Ctrl+V or select an image with the file input field below.',
       import_error: 'Could not import image, the image is probably too big to retrieve. If you used the clipboard, you may want to download the image and try the file input field above instead.',
+      pgw_file_label: 'World file (.pgw, optional – select this before the image to auto-align):',
+      pgw_parse_error: 'Could not read world file. Make sure it is a valid 6-line world file (.pgw, .jgw, .tfw, etc.).',
       align_image: 'Align with map',
       align_image_description: "You can use the controls below to align the image overlay with the map. Use the 'Attach to map' button to finish.",
       attach_image: 'Attach to map',
@@ -434,15 +436,55 @@ async function onWmeReady() {
     description.textContent = I18n.t('image_overlays.import_image_description');
     var addImageInput = document.createElement('input');
     addImageInput.type = 'file';
-    addImageInput.accepts = 'image/*';
+    addImageInput.accept = 'image/*';
     addImageInput.className = 'center-block';
-    addImageInput.addEventListener('change', function() {
-      displayAlignPage({
-        blob: addImageInput.files[0]
-      });
-    });
+    var pgwInput = document.createElement('input');
+    pgwInput.type = 'file';
+    pgwInput.accept = '.pgw,.jgw,.tfw,.wld,.bpw,.gfw';
+    pgwInput.className = 'center-block';
+    pgwInput.style.marginTop = '8px';
+    var pgwLabel = document.createElement('label');
+    pgwLabel.textContent = I18n.t('image_overlays.pgw_file_label');
+    pgwLabel.style.display = 'block';
+    pgwLabel.style.marginTop = '8px';
+    var pgwError = document.createElement('p');
+    pgwError.className = 'hidden text-danger';
+    pgwError.textContent = I18n.t('image_overlays.pgw_parse_error');
+    var tryLoadImage = function() {
+      if (!addImageInput.files[0]) return;
+      importError.classList.add('hidden');
+      pgwError.classList.add('hidden');
+      if (pgwInput.files[0]) {
+        var reader = new FileReader();
+        reader.addEventListener('load', function() {
+          var pgwParams = parsePgwFile(reader.result);
+          if (!pgwParams) {
+            pgwError.classList.remove('hidden');
+            return;
+          }
+          var tempUrl = window.URL.createObjectURL(addImageInput.files[0]);
+          var tempImg = document.createElement('img');
+          tempImg.addEventListener('load', function() {
+            var overlayData = buildOverlayFromPgw(pgwParams, addImageInput.files[0], tempImg.naturalWidth, tempImg.naturalHeight);
+            window.URL.revokeObjectURL(tempUrl);
+            displayAlignPage(overlayData);
+          });
+          tempImg.src = tempUrl;
+        });
+        reader.readAsText(pgwInput.files[0]);
+      } else {
+        displayAlignPage({
+          blob: addImageInput.files[0]
+        });
+      }
+    };
+    addImageInput.addEventListener('change', tryLoadImage);
+    pgwInput.addEventListener('change', tryLoadImage);
     instructions.textContent = '';
     instructions.appendChild(addImageInput);
+    instructions.appendChild(pgwLabel);
+    instructions.appendChild(pgwInput);
+    instructions.appendChild(pgwError);
     instructions.appendChild(importError);
 
     if (navigator.storage.persist) {
@@ -463,7 +505,7 @@ async function onWmeReady() {
     exportButton.classList.add('hidden');
     pinToMapButton.classList.remove('hidden');
 
-    displayImageOverlay(overlay, !currentKey);
+    displayImageOverlay(overlay, !currentKey && !overlay.extent);
 
     description.textContent = I18n.t('image_overlays.align_image_description');
     var scale = document.createElement('input');
@@ -921,6 +963,54 @@ function getIndexedDB(callback) {
 function getMapExtent() {
   let dataProjection = new OpenLayers.Projection('EPSG:4326');
   return (new OpenLayers.Bounds(W.map.getExtent())).transform(dataProjection, W.map.getProjectionObject());
+}
+
+function parsePgwFile(text) {
+  var lines = text.trim().split(/\r?\n/);
+  if (lines.length < 6) return null;
+  var params = lines.slice(0, 6).map(parseFloat);
+  if (params.some(isNaN)) return null;
+  return {
+    scaleX: params[0],
+    rotationY: params[1],
+    rotationX: params[2],
+    scaleY: params[3],
+    originX: params[4],
+    originY: params[5]
+  };
+}
+
+function buildOverlayFromPgw(pgw, blob, imgWidth, imgHeight) {
+  // Affine transform: x = A*col + B*row + C,  y = D*col + E*row + F
+  var A = pgw.scaleX, B = pgw.rotationX, C = pgw.originX;
+  var D = pgw.rotationY, E = pgw.scaleY, F = pgw.originY;
+  // Compute the 4 outer-boundary corners of the image using the affine transform
+  var corners = [
+    { col: -0.5, row: -0.5 },
+    { col: imgWidth - 0.5, row: -0.5 },
+    { col: imgWidth - 0.5, row: imgHeight - 0.5 },
+    { col: -0.5, row: imgHeight - 0.5 }
+  ].map(function(p) {
+    return { x: A * p.col + B * p.row + C, y: D * p.col + E * p.row + F };
+  });
+  var xs = corners.map(function(c) { return c.x; });
+  var ys = corners.map(function(c) { return c.y; });
+  var rawBounds = new OpenLayers.Bounds(
+    Math.min.apply(null, xs), Math.min.apply(null, ys),
+    Math.max.apply(null, xs), Math.max.apply(null, ys)
+  );
+  // If origin coords fit within geographic degree ranges AND the scale is sub-degree
+  // then the coordinates are in EPSG:4326 and must be projected to the map's native CRS.
+  // Otherwise (large origin values in meters, or scale ≥ 1 indicating meters/pixel)
+  // the coordinates are already in the map projection and must be used as-is.
+  var isGeographicDegrees = Math.abs(pgw.originX) <= 180 && Math.abs(pgw.originY) <= 90 && Math.abs(pgw.scaleX) < 1;
+  var bounds = isGeographicDegrees
+    ? rawBounds.transform(new OpenLayers.Projection('EPSG:4326'), W.map.getProjectionObject())
+    : rawBounds;
+  // Rotation: atan2(D, A) gives the angle of the image x-axis in geographic space (y-up).
+  // Negated to convert from geographic (y-up, CCW-positive) to screen (y-down, CW-positive).
+  var rotation = -Math.atan2(D, A) * 180 / Math.PI;
+  return { blob: blob, extent: bounds.toArray(), rotation: rotation };
 }
 
 function log(message) {
